@@ -1,1 +1,15 @@
-{"name":"naver-api-proxy","version":"1.0.0","main":"server.js","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.18.2","node-fetch":"^3.3.2","bcryptjs":"^2.4.3"}}
+{
+  "name": "naver-api-proxy",
+  "version": "1.0.0",
+  "description": "Fixed IP proxy for Naver Commerce API",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "express": "^4.18.2",
+    "node-fetch": "^3.3.2"
+  }
+}
