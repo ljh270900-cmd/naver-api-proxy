@@ -5,7 +5,6 @@
 
 import express from 'express';
 import fetch from 'node-fetch';
-import crypto from 'crypto';
 
 const app = express();
 app.use(express.json());
@@ -83,24 +82,33 @@ app.post('/api/test', authenticate, async (req, res) => {
 });
 
 /**
- * 24시간 윈도우 하나에 대해 변경 상품 주문 목록을 조회 (페이지네이션 포함)
- * 반환: productOrderId 배열
+ * Date 객체를 네이버 API 요구 형식(KST ISO8601)으로 변환
+ * 예: 2026-03-01T00:00:00.000+09:00
  */
-async function fetchChangedOrderIds(token, from, to) {
-  const allIds = [];
-  let moreSequence = null;
-  let currentFrom = from;
+function toKstIsoString(date) {
+  const kst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
+  return `${kst.toISOString().slice(0, 23)}+09:00`;
+}
+
+/**
+ * 조건형 상품 주문 상세 내역 조회 (페이지네이션 포함)
+ * GET /v1/pay-order/seller/product-orders
+ */
+async function fetchOrdersByConditions(token, from, to) {
+  const allOrders = [];
+  let page = 1;
 
   while (true) {
     const params = new URLSearchParams({
-      lastChangedFrom: currentFrom,
+      from,
+      to,
+      rangeType: 'PAYED_DATETIME',
+      pageSize: '300',
+      page: String(page),
     });
-    if (to) params.append('lastChangedTo', to);
-    if (moreSequence) params.append('moreSequence', moreSequence);
-    params.append('limitCount', '300');
 
-    const url = `${NAVER_API_BASE}/v1/pay-order/seller/product-orders/last-changed-statuses?${params.toString()}`;
-    console.log(`[fetchChangedOrderIds] GET ${url}`);
+    const url = `${NAVER_API_BASE}/v1/pay-order/seller/product-orders?${params.toString()}`;
+    console.log(`[fetchOrdersByConditions] GET ${url}`);
 
     const res = await fetch(url, {
       method: 'GET',
@@ -111,65 +119,22 @@ async function fetchChangedOrderIds(token, from, to) {
 
     if (!res.ok) {
       const text = await res.text();
-      throw new Error(`last-changed-statuses failed: ${res.status} ${text}`);
-    }
-
-    const result = await res.json();
-    const statuses = result.data?.lastChangeStatuses || [];
-
-    for (const s of statuses) {
-      if (s.productOrderId) {
-        allIds.push(s.productOrderId);
-      }
-    }
-
-    console.log(`[fetchChangedOrderIds] Got ${statuses.length} statuses, total so far: ${allIds.length}`);
-
-    // 페이지네이션: more 객체가 있으면 계속
-    if (result.data?.more) {
-      currentFrom = result.data.more.moreFrom;
-      moreSequence = result.data.more.moreSequence;
-      await new Promise(r => setTimeout(r, 200));
-    } else {
-      break;
-    }
-  }
-
-  return allIds;
-}
-
-/**
- * productOrderIds로 상세 내역 조회 (최대 300개씩 배치)
- */
-async function fetchOrderDetails(token, productOrderIds) {
-  const allOrders = [];
-
-  for (let i = 0; i < productOrderIds.length; i += 300) {
-    const batch = productOrderIds.slice(i, i + 300);
-
-    const res = await fetch(`${NAVER_API_BASE}/v1/pay-order/seller/product-orders/query`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ productOrderIds: batch }),
-    });
-
-    if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`product-orders/query failed: ${res.status} ${text}`);
+      throw new Error(`product-orders failed: ${res.status} ${text}`);
     }
 
     const result = await res.json();
     const orders = result.data || [];
     allOrders.push(...orders);
 
-    console.log(`[fetchOrderDetails] Batch ${Math.floor(i/300)+1}: ${orders.length} orders`);
+    console.log(`[fetchOrdersByConditions] Page ${page}: ${orders.length} orders, total: ${allOrders.length}`);
 
-    if (i + 300 < productOrderIds.length) {
-      await new Promise(r => setTimeout(r, 200));
+    if (orders.length < 300) break;
+
+    page += 1;
+    if (page > 200) {
+      throw new Error('Pagination safety limit exceeded (page > 200)');
     }
+    await new Promise(r => setTimeout(r, 200));
   }
 
   return allOrders;
@@ -181,13 +146,14 @@ app.post('/api/sync', authenticate, async (req, res) => {
     const { fromDate, toDate } = req.body;
     const token = await getNaverToken();
 
+    // 날짜 범위 결정
     const endDateStr = toDate || new Date().toISOString().split('T')[0];
     const startDateStr = fromDate || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
     console.log(`[sync] Date range: ${startDateStr} ~ ${endDateStr}`);
 
-    // 24시간 단위로 윈도우를 나눠서 호출
-    const allProductOrderIds = new Set();
+    // 24시간 단위로 윈도우 분할 후 조건형 주문조회 호출
+    const uniqueOrders = new Map();
     let currentDate = new Date(`${startDateStr}T00:00:00+09:00`);
     const endDate = new Date(`${endDateStr}T23:59:59+09:00`);
 
@@ -195,12 +161,17 @@ app.post('/api/sync', authenticate, async (req, res) => {
       const windowEnd = new Date(currentDate.getTime() + 24 * 60 * 60 * 1000);
       const effectiveEnd = windowEnd > endDate ? endDate : windowEnd;
 
-      const fromStr = currentDate.toISOString().replace('Z', '+09:00');
-      const toStr = effectiveEnd.toISOString().replace('Z', '+09:00');
+      const fromStr = toKstIsoString(currentDate);
+      const toStr = toKstIsoString(effectiveEnd);
 
       try {
-        const ids = await fetchChangedOrderIds(token, fromStr, toStr);
-        ids.forEach(id => allProductOrderIds.add(id));
+        const ordersInWindow = await fetchOrdersByConditions(token, fromStr, toStr);
+
+        for (const item of ordersInWindow) {
+          const po = item?.productOrder || {};
+          const key = po.productOrderId || item?.order?.orderId;
+          if (key) uniqueOrders.set(key, item);
+        }
       } catch (e) {
         console.error(`[sync] Error fetching window ${fromStr} ~ ${toStr}: ${e.message}`);
       }
@@ -209,13 +180,9 @@ app.post('/api/sync', authenticate, async (req, res) => {
       await new Promise(r => setTimeout(r, 300));
     }
 
-    console.log(`[sync] Total unique productOrderIds: ${allProductOrderIds.size}`);
+    const orders = [...uniqueOrders.values()];
 
-    // 상세 내역 조회
-    let orders = [];
-    if (allProductOrderIds.size > 0) {
-      orders = await fetchOrderDetails(token, [...allProductOrderIds]);
-    }
+    console.log(`[sync] Total unique orders: ${orders.length}`);
 
     // 데이터 변환
     const mappedOrders = orders.map(item => {
