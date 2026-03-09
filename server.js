@@ -51,7 +51,7 @@ async function getNaverToken() {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Token request failed: ${res.status} ${text}`);
+    throw new Error(`Token failed: ${text}`);
   }
 
   const data = await res.json();
@@ -91,50 +91,87 @@ function toKstIsoString(date) {
 }
 
 /**
- * 조건형 상품 주문 상세 내역 조회 (페이지네이션 포함)
- * GET /v1/pay-order/seller/product-orders
+ * 네이버 응답에서 주문 배열을 추출
+ * 응답 구조: { data: { contents: [...], pagination: {...} } }
  */
+function extractOrderRows(result) {
+  const data = result?.data;
+  if (Array.isArray(data)) return data;
+  if (Array.isArray(data?.contents)) return data.contents;
+  if (Array.isArray(data?.items)) return data.items;
+  if (Array.isArray(result?.contents)) return result.contents;
+  return [];
+}
+
 async function fetchOrdersByConditions(token, from, to) {
   const allOrders = [];
   let page = 1;
+  const pageSize = 300;
+
+  const productOrderStatuses = [
+    "PAYMENT_WAITING",
+    "PAYED",
+    "DELIVERING",
+    "DELIVERED",
+    "PURCHASE_DECIDED",
+    "EXCHANGED",
+    "CANCELED",
+    "CANCELED_BY_NOPAYMENT",
+    "RETURNED",
+  ];
 
   while (true) {
     const params = new URLSearchParams({
       from,
       to,
-      rangeType: 'PAYED_DATETIME',
-      pageSize: '300',
+      rangeType: "PAYED_DATETIME",
+      pageSize: String(pageSize),
       page: String(page),
+      productOrderStatuses: productOrderStatuses.join(","),
     });
 
     const url = `${NAVER_API_BASE}/v1/pay-order/seller/product-orders?${params.toString()}`;
     console.log(`[fetchOrdersByConditions] GET ${url}`);
 
     const res = await fetch(url, {
-      method: 'GET',
+      method: "GET",
       headers: {
         Authorization: `Bearer ${token}`,
       },
     });
 
+    const raw = await res.text();
     if (!res.ok) {
-      const text = await res.text();
-      throw new Error(`product-orders failed: ${res.status} ${text}`);
+      throw new Error(`product-orders failed: ${res.status} ${raw}`);
     }
 
-    const result = await res.json();
-    const orders = result.data || [];
+    let result;
+    try {
+      result = raw ? JSON.parse(raw) : null;
+    } catch {
+      throw new Error(`product-orders invalid json: ${raw?.slice?.(0, 500)}`);
+    }
+
+    const orders = extractOrderRows(result);
     allOrders.push(...orders);
 
-    console.log(`[fetchOrdersByConditions] Page ${page}: ${orders.length} orders, total: ${allOrders.length}`);
+    console.log(
+      `[fetchOrdersByConditions] Page ${page}: ${orders.length} orders, total: ${allOrders.length}`,
+    );
 
-    if (orders.length < 300) break;
+    // pagination 메타를 우선 사용
+    const pagination = result?.data?.pagination;
+    const totalPages = pagination?.totalPages ?? pagination?.totalPage;
+    if (typeof totalPages === "number" && page >= totalPages) break;
+
+    // 메타가 없으면 size 기반으로 탈출
+    if (orders.length < pageSize) break;
 
     page += 1;
     if (page > 200) {
-      throw new Error('Pagination safety limit exceeded (page > 200)');
+      throw new Error("Pagination safety limit exceeded (page > 200)");
     }
-    await new Promise(r => setTimeout(r, 200));
+    await new Promise((r) => setTimeout(r, 200));
   }
 
   return allOrders;
@@ -157,6 +194,9 @@ app.post('/api/sync', authenticate, async (req, res) => {
     let currentDate = new Date(`${startDateStr}T00:00:00+09:00`);
     const endDate = new Date(`${endDateStr}T23:59:59+09:00`);
 
+    let windowErrorCount = 0;
+    let lastWindowError = null;
+
     while (currentDate < endDate) {
       const windowEnd = new Date(currentDate.getTime() + 24 * 60 * 60 * 1000);
       const effectiveEnd = windowEnd > endDate ? endDate : windowEnd;
@@ -173,6 +213,8 @@ app.post('/api/sync', authenticate, async (req, res) => {
           if (key) uniqueOrders.set(key, item);
         }
       } catch (e) {
+        windowErrorCount += 1;
+        lastWindowError = e;
         console.error(`[sync] Error fetching window ${fromStr} ~ ${toStr}: ${e.message}`);
       }
 
@@ -182,9 +224,18 @@ app.post('/api/sync', authenticate, async (req, res) => {
 
     const orders = [...uniqueOrders.values()];
 
+    // 모든 윈도우가 실패했으면 오류로 반환 (0건 성공으로 숨기지 않음)
+    if (orders.length === 0 && windowErrorCount > 0) {
+      return res.status(500).json({
+        success: false,
+        error: `주문 조회 실패: ${windowErrorCount}개 구간에서 오류가 발생했습니다.`,
+        detail: lastWindowError?.message,
+      });
+    }
+
     console.log(`[sync] Total unique orders: ${orders.length}`);
 
-    // 데이터 변환
+    // 프론트엔드에서 사용할 수 있도록 데이터 변환
     const mappedOrders = orders.map(item => {
       const order = item.order || {};
       const po = item.productOrder || {};
@@ -238,6 +289,4 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Naver API Proxy running on port ${PORT}`);
-});
+app.list
