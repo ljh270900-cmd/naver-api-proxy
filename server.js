@@ -51,7 +51,7 @@ async function getNaverToken() {
 
   if (!res.ok) {
     const text = await res.text();
-    throw new Error(`Token failed: ${text}`);
+    throw new Error(`Token request failed: ${res.status} ${text}`);
   }
 
   const data = await res.json();
@@ -91,8 +91,8 @@ function toKstIsoString(date) {
 }
 
 /**
- * 네이버 응답에서 주문 배열을 추출
- * 응답 구조: { data: { contents: [...], pagination: {...} } }
+ * 조건형 상품 주문 상세 내역 조회 (페이지네이션 포함)
+ * GET /v1/pay-order/seller/product-orders
  */
 function extractOrderRows(result) {
   const data = result?.data;
@@ -121,14 +121,15 @@ async function fetchOrdersByConditions(token, from, to) {
   ];
 
   while (true) {
-    const params = new URLSearchParams({
-      from,
-      to,
-      rangeType: "PAYED_DATETIME",
-      pageSize: String(pageSize),
-      page: String(page),
-      productOrderStatuses: productOrderStatuses.join(","),
-    });
+    const params = new URLSearchParams();
+    params.append("from", from);
+    params.append("to", to);
+    params.append("rangeType", "PAYED_DATETIME");
+    params.append("pageSize", String(pageSize));
+    params.append("page", String(page));
+    for (const status of productOrderStatuses) {
+      params.append("productOrderStatuses", status);
+    }
 
     const url = `${NAVER_API_BASE}/v1/pay-order/seller/product-orders?${params.toString()}`;
     console.log(`[fetchOrdersByConditions] GET ${url}`);
@@ -159,12 +160,10 @@ async function fetchOrdersByConditions(token, from, to) {
       `[fetchOrdersByConditions] Page ${page}: ${orders.length} orders, total: ${allOrders.length}`,
     );
 
-    // pagination 메타를 우선 사용
     const pagination = result?.data?.pagination;
     const totalPages = pagination?.totalPages ?? pagination?.totalPage;
     if (typeof totalPages === "number" && page >= totalPages) break;
 
-    // 메타가 없으면 size 기반으로 탈출
     if (orders.length < pageSize) break;
 
     page += 1;
@@ -183,13 +182,11 @@ app.post('/api/sync', authenticate, async (req, res) => {
     const { fromDate, toDate } = req.body;
     const token = await getNaverToken();
 
-    // 날짜 범위 결정
     const endDateStr = toDate || new Date().toISOString().split('T')[0];
     const startDateStr = fromDate || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
     console.log(`[sync] Date range: ${startDateStr} ~ ${endDateStr}`);
 
-    // 24시간 단위로 윈도우 분할 후 조건형 주문조회 호출
     const uniqueOrders = new Map();
     let currentDate = new Date(`${startDateStr}T00:00:00+09:00`);
     const endDate = new Date(`${endDateStr}T23:59:59+09:00`);
@@ -224,7 +221,6 @@ app.post('/api/sync', authenticate, async (req, res) => {
 
     const orders = [...uniqueOrders.values()];
 
-    // 모든 윈도우가 실패했으면 오류로 반환 (0건 성공으로 숨기지 않음)
     if (orders.length === 0 && windowErrorCount > 0) {
       return res.status(500).json({
         success: false,
@@ -235,7 +231,6 @@ app.post('/api/sync', authenticate, async (req, res) => {
 
     console.log(`[sync] Total unique orders: ${orders.length}`);
 
-    // 프론트엔드에서 사용할 수 있도록 데이터 변환
     const mappedOrders = orders.map(item => {
       const order = item.order || {};
       const po = item.productOrder || {};
@@ -289,4 +284,6 @@ app.get('/health', (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.list
+app.listen(PORT, () => {
+  console.log(`Naver API Proxy running on port ${PORT}`);
+});
