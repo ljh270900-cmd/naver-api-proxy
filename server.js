@@ -86,18 +86,31 @@ app.post('/api/test', authenticate, async (req, res) => {
  * 예: 2026-03-01T00:00:00.000+09:00
  */
 function toKstIsoString(date) {
-  const kst = new Date(date.getTime() + 9 * 60 * 60 * 1000);
-  return `${kst.toISOString().slice(0, 23)}+09:00`;
+  const kstMs = date.getTime() + 9 * 60 * 60 * 1000;
+  const kst = new Date(kstMs);
+
+  const yyyy = kst.getUTCFullYear();
+  const mm = String(kst.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(kst.getUTCDate()).padStart(2, '0');
+  const hh = String(kst.getUTCHours()).padStart(2, '0');
+  const mi = String(kst.getUTCMinutes()).padStart(2, '0');
+  const ss = String(kst.getUTCSeconds()).padStart(2, '0');
+  const ms = String(kst.getUTCMilliseconds()).padStart(3, '0');
+
+  return `${yyyy}-${mm}-${dd}T${hh}:${mi}:${ss}.${ms}+09:00`;
 }
 
 /**
  * 조건형 상품 주문 상세 내역 조회 (페이지네이션 포함)
  * GET /v1/pay-order/seller/product-orders
+ *
+ * NOTE: 네이버 응답은 보통 `data.contents`에 배열이 들어옵니다.
  */
 function extractOrderRows(result) {
   const data = result?.data;
   if (Array.isArray(data)) return data;
   if (Array.isArray(data?.contents)) return data.contents;
+  // 일부 케이스에서 다른 키로 내려올 가능성 대비
   if (Array.isArray(data?.items)) return data.items;
   if (Array.isArray(result?.contents)) return result.contents;
   return [];
@@ -108,6 +121,7 @@ async function fetchOrdersByConditions(token, from, to) {
   let page = 1;
   const pageSize = 300;
 
+  // 실무에서 조건형 조회가 빈 배열로 나오는 경우가 많아, status 조건을 넓게 포함
   const productOrderStatuses = [
     "PAYMENT_WAITING",
     "PAYED",
@@ -157,13 +171,15 @@ async function fetchOrdersByConditions(token, from, to) {
     allOrders.push(...orders);
 
     console.log(
-      `[fetchOrdersByConditions] Page ${page}: ${orders.length} orders, total: ${allOrders.length}`,
+      `[fetchOrdersByConditions] Page ${page}: ${orders.length} orders, total: ${allOrders.length} (shape: ${orders === result?.data ? "data[]" : "data.contents"})`,
     );
 
+    // pagination 메타를 우선 사용
     const pagination = result?.data?.pagination;
     const totalPages = pagination?.totalPages ?? pagination?.totalPage;
     if (typeof totalPages === "number" && page >= totalPages) break;
 
+    // 메타가 없으면 size 기반으로 탈출
     if (orders.length < pageSize) break;
 
     page += 1;
@@ -182,11 +198,13 @@ app.post('/api/sync', authenticate, async (req, res) => {
     const { fromDate, toDate } = req.body;
     const token = await getNaverToken();
 
+    // 날짜 범위 결정
     const endDateStr = toDate || new Date().toISOString().split('T')[0];
     const startDateStr = fromDate || new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
 
     console.log(`[sync] Date range: ${startDateStr} ~ ${endDateStr}`);
 
+    // 24시간 단위로 윈도우 분할 후 조건형 주문조회 호출
     const uniqueOrders = new Map();
     let currentDate = new Date(`${startDateStr}T00:00:00+09:00`);
     const endDate = new Date(`${endDateStr}T23:59:59+09:00`);
@@ -204,10 +222,24 @@ app.post('/api/sync', authenticate, async (req, res) => {
       try {
         const ordersInWindow = await fetchOrdersByConditions(token, fromStr, toStr);
 
+        if (ordersInWindow.length > 0) {
+          const first = ordersInWindow[0];
+          console.log('[sync] First order shape keys:', Object.keys(first || {}).slice(0, 20));
+        }
+
         for (const item of ordersInWindow) {
-          const po = item?.productOrder || {};
-          const key = po.productOrderId || item?.order?.orderId;
-          if (key) uniqueOrders.set(key, item);
+          const po = item?.productOrder || item || {};
+          const order = item?.order || item || {};
+
+          const key =
+            po.productOrderId ||
+            item?.productOrderId ||
+            order.orderId ||
+            item?.orderId;
+
+          if (key) {
+            uniqueOrders.set(key, item);
+          }
         }
       } catch (e) {
         windowErrorCount += 1;
@@ -221,6 +253,7 @@ app.post('/api/sync', authenticate, async (req, res) => {
 
     const orders = [...uniqueOrders.values()];
 
+    // 모든 윈도우가 실패했는데도 0건이면, '0건'이 아니라 오류로 처리(원인 파악 가능)
     if (orders.length === 0 && windowErrorCount > 0) {
       return res.status(500).json({
         success: false,
@@ -231,26 +264,31 @@ app.post('/api/sync', authenticate, async (req, res) => {
 
     console.log(`[sync] Total unique orders: ${orders.length}`);
 
+    // 프론트엔드에서 사용할 수 있도록 데이터 변환
     const mappedOrders = orders.map(item => {
-      const order = item.order || {};
-      const po = item.productOrder || {};
+      const order = item?.order || item || {};
+      const po = item?.productOrder || item || {};
+
+      const productOrderStatus = po.productOrderStatus || item?.productOrderStatus;
+      const totalPaymentAmount = po.totalPaymentAmount || item?.totalPaymentAmount || 0;
+      const claimStatus = po.claimStatus || item?.claimStatus || '';
 
       return {
-        orderId: order.orderId,
-        productOrderId: po.productOrderId,
-        orderDate: order.orderDate,
-        paymentDate: order.paymentDate,
-        productOrderStatus: po.productOrderStatus,
-        totalPaymentAmount: po.totalPaymentAmount || 0,
-        productName: po.productName,
-        quantity: po.quantity || 1,
-        unitPrice: po.unitPrice || 0,
-        buyerName: order.ordererName,
-        shippingFeeAmount: po.deliveryFeeAmount || 0,
-        commissionAmount: po.commissionAmount || 0,
-        cancelAmount: po.claimStatus?.includes('CANCEL') ? (po.totalPaymentAmount || 0) : 0,
-        refundAmount: po.claimStatus?.includes('RETURN') ? (po.totalPaymentAmount || 0) : 0,
-        sellerProductCode: po.sellerProductCode,
+        orderId: order.orderId || item?.orderId,
+        productOrderId: po.productOrderId || item?.productOrderId,
+        orderDate: order.orderDate || item?.orderDate,
+        paymentDate: order.paymentDate || item?.paymentDate,
+        productOrderStatus,
+        totalPaymentAmount,
+        productName: po.productName || item?.productName,
+        quantity: po.quantity || item?.quantity || 1,
+        unitPrice: po.unitPrice || item?.unitPrice || 0,
+        buyerName: order.ordererName || item?.buyerName || item?.ordererName,
+        shippingFeeAmount: po.deliveryFeeAmount || item?.deliveryFeeAmount || item?.shippingFeeAmount || 0,
+        commissionAmount: po.commissionAmount || item?.commissionAmount || 0,
+        cancelAmount: String(claimStatus).includes('CANCEL') ? totalPaymentAmount : 0,
+        refundAmount: String(claimStatus).includes('RETURN') ? totalPaymentAmount : 0,
+        sellerProductCode: po.sellerProductCode || item?.sellerProductCode,
       };
     });
 
